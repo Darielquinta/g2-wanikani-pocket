@@ -46,7 +46,19 @@ npm install
 npm run dev
 ```
 
-Open the app from Even Hub or the simulator, paste the token, and save.
+`npm install` installs the Even Hub SDK dependency used by the app:
+
+```ts
+import { waitForEvenAppBridge } from '@evenrealities/even_hub_sdk'
+```
+
+For a browser-only smoke test, use the Vite dev server or run the Even Hub simulator against it:
+
+```bash
+npm run simulate
+```
+
+Open the app from Even Hub or the simulator, paste the token, and save. If the Codex Cloud/browser environment cannot provide glasses-only bridge APIs, the companion UI continues in browser mode; verify tap/swipe/double-tap gestures and page-container rendering on your Even G2 before publishing.
 
 ## Package
 
