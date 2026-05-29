@@ -7,7 +7,7 @@ import {
   type EvenAppBridge,
   type EvenHubEvent,
 } from '@evenrealities/even_hub_sdk'
-import { PersistStore, TOKEN_KEY } from './storage'
+import { PersistStore, STARRED_SUBJECTS_KEY, TOKEN_KEY } from './storage'
 import {
   WaniKaniClient,
   acceptedMeanings,
@@ -15,19 +15,21 @@ import {
   displaySubject,
   hasReadingQuestion,
   meaningMatches,
+  radicalDisplayUnavailable,
   readingMatches,
   shortError,
   stripHtml,
   subjectKindLabel,
   toHiragana,
   type StudyItem,
+  type SubjectResource,
   type UserData,
   type WkResource,
 } from './wanikani'
 
 type Gesture = 'tap' | 'up' | 'down' | 'double'
-type Mode = 'setup' | 'home' | 'loading' | 'message' | 'help' | 'reviewQuestion' | 'reviewCorrection' | 'lesson' | 'lessonReviewQuestion' | 'lessonCheckpoint'
-type ActionName = 'reviews' | 'lessons' | 'refresh' | 'help'
+type Mode = 'setup' | 'home' | 'loading' | 'message' | 'help' | 'starred' | 'reviewQuestion' | 'reviewCorrection' | 'lesson' | 'lessonReviewQuestion' | 'lessonCheckpoint'
+type ActionName = 'reviews' | 'lessons' | 'starred' | 'refresh' | 'help'
 type ReviewPart = 'meaning' | 'reading'
 
 interface Dashboard {
@@ -47,6 +49,9 @@ interface ViewModel {
 const HEADER_ID = 1
 const BODY_ID = 2
 const FOOTER_ID = 3
+const BODY_PAGE_CHARS = 220
+const BODY_PAGE_LINES = 7
+const HOME_PAGE_SIZE = 3
 const EMPTY_DASHBOARD: Dashboard = {
   user: null,
   reviewCount: 0,
@@ -95,7 +100,7 @@ class G2Display {
             containerID: BODY_ID,
             containerName: 'body',
             content: clip(initial.body, 900),
-            isEventCapture: 1,
+            isEventCapture: 0,
           }),
           new TextContainerProperty({
             xPosition: 0,
@@ -109,7 +114,7 @@ class G2Display {
             containerID: FOOTER_ID,
             containerName: 'footer',
             content: clip(initial.footer, 900),
-            isEventCapture: 0,
+            isEventCapture: 1,
           }),
         ],
       }),
@@ -182,6 +187,12 @@ class WaniPocketApp {
   private lessonReviewPart: ReviewPart = 'meaning'
   private lessonReviewFeedback = ''
   private lessonReviewBatchStart = 0
+  private pageIndex = 0
+  private viewSignature = ''
+  private starredIds = new Set<number>()
+  private starredSubjects: SubjectResource[] = []
+  private starredIndex = 0
+  private starredPage = 0
   private typingRenderTimer: number | null = null
   private unsubscribe: (() => void) | null = null
 
@@ -201,6 +212,7 @@ class WaniPocketApp {
       window.addEventListener('beforeunload', () => this.cleanup())
     }
 
+    await this.loadStarredSubjects()
     this.token = (await this.store.get(TOKEN_KEY)).trim()
     this.updateTokenInput()
 
@@ -244,6 +256,8 @@ class WaniPocketApp {
   }
 
   private async handleGesture(gesture: Gesture): Promise<void> {
+    if ((gesture === 'up' || gesture === 'down') && this.handleBodyPageGesture(gesture)) return
+
     switch (this.mode) {
       case 'setup':
         if (gesture === 'tap') await this.refreshDashboard(true)
@@ -258,15 +272,20 @@ class WaniPocketApp {
       case 'help':
         if (gesture === 'double' || gesture === 'tap') this.goHome()
         break
+      case 'starred':
+        await this.handleStarredGesture(gesture)
+        break
       case 'message':
         if (gesture === 'tap' || gesture === 'double') this.goHome()
         break
       case 'reviewQuestion':
         if (gesture === 'double') this.goHome()
+        if (gesture === 'up') await this.toggleCurrentSubjectStar()
         if (gesture === 'tap') this.focusAnswerInput()
         break
       case 'lessonReviewQuestion':
         if (gesture === 'double') this.showLessonCheckpoint()
+        if (gesture === 'up') await this.toggleCurrentSubjectStar()
         if (gesture === 'tap') this.focusAnswerInput()
         break
       case 'lessonCheckpoint':
@@ -275,6 +294,7 @@ class WaniPocketApp {
         break
       case 'reviewCorrection':
         if (gesture === 'double') this.goHome()
+        else if (gesture === 'up') await this.toggleCurrentSubjectStar()
         else if (gesture === 'tap') this.continueAfterCorrection()
         break
       case 'lesson':
@@ -299,6 +319,7 @@ class WaniPocketApp {
     const action = this.homeActions()[this.homeIndex]?.name
     if (action === 'reviews') await this.startReviews()
     if (action === 'lessons') await this.startLessons()
+    if (action === 'starred') await this.startStarred()
     if (action === 'refresh') await this.refreshDashboard(true)
     if (action === 'help') {
       this.mode = 'help'
@@ -321,6 +342,10 @@ class WaniPocketApp {
     const maxPage = this.lessonPages(item).length - 1
 
     if (gesture === 'up') {
+      if (this.lessonPage === 0) {
+        await this.toggleCurrentSubjectStar()
+        return
+      }
       this.lessonPage = Math.max(0, this.lessonPage - 1)
       this.render()
       return
@@ -381,13 +406,20 @@ class WaniPocketApp {
     this.showLoading('Loading reviews', 'Pulling available review assignments and answer data.')
 
     try {
-      this.reviewQueue = await this.wk!.getStudyItems('reviews', 50)
+      const loadedReviews = await this.wk!.getStudyItems('reviews', 50)
+      const skippedRadicals = loadedReviews.filter(item => radicalDisplayUnavailable(item.subject)).length
+      this.reviewQueue = loadedReviews.filter(item => !radicalDisplayUnavailable(item.subject))
       this.reviewIndex = 0
       this.correctionItem = null
-      this.resetReviewAttempt('Type the meaning on your keyboard, then press Enter.')
+      this.resetReviewAttempt(skippedRadicals
+        ? `Skipped ${skippedRadicals} radical${skippedRadicals === 1 ? '' : 's'} this device cannot display. Please review ${skippedRadicals === 1 ? 'it' : 'them'} on WaniKani.`
+        : 'Type the meaning on your keyboard, then press Enter.')
 
       if (this.reviewQueue.length === 0) {
-        this.showMessage('No reviews', nextReviewLine(this.dashboard.nextReviewsAt))
+        const skippedLine = skippedRadicals
+          ? `\n\nSkipped ${skippedRadicals} radical${skippedRadicals === 1 ? '' : 's'} this device cannot display. Please review ${skippedRadicals === 1 ? 'it' : 'them'} on WaniKani.`
+          : ''
+        this.showMessage('No reviews', `${nextReviewLine(this.dashboard.nextReviewsAt)}${skippedLine}`)
         return
       }
 
@@ -484,7 +516,7 @@ class WaniPocketApp {
   }
 
   updateLiveAnswer(answer: string): void {
-    const value = this.shouldKanaInput() ? toHiragana(answer) : answer
+    const value = this.shouldKanaInput() ? toHiragana(answer, { finalizeN: false }) : answer
     this.liveAnswer = value
     const input = document.querySelector<HTMLInputElement>('#answerInput')
     if (input && input.value !== value) input.value = value
@@ -724,6 +756,113 @@ class WaniPocketApp {
     return this.lessonQueue[this.lessonIndex] || null
   }
 
+  private currentSubject(): SubjectResource | null {
+    if (this.mode === 'lesson') return this.currentLesson()?.subject || null
+    if (this.mode === 'reviewQuestion') return this.currentReview()?.subject || null
+    if (this.mode === 'reviewCorrection') return this.correctionItem?.subject || null
+    if (this.mode === 'lessonReviewQuestion') return this.lessonReviewQueue[this.lessonReviewIndex]?.subject || null
+    if (this.mode === 'starred') return this.starredSubjects[this.starredIndex] || null
+    return null
+  }
+
+  private async loadStarredSubjects(): Promise<void> {
+    const raw = await this.store.get(STARRED_SUBJECTS_KEY)
+    try {
+      const parsed = JSON.parse(raw || '[]') as unknown
+      if (Array.isArray(parsed)) {
+        this.starredIds = new Set(parsed.filter((id): id is number => Number.isInteger(id) && id > 0))
+      }
+    } catch {
+      this.starredIds = new Set()
+    }
+  }
+
+  private async saveStarredSubjects(): Promise<void> {
+    await this.store.set(STARRED_SUBJECTS_KEY, JSON.stringify(Array.from(this.starredIds)))
+  }
+
+  private async toggleCurrentSubjectStar(): Promise<void> {
+    const subject = this.currentSubject()
+    if (!subject) return
+
+    if (this.starredIds.has(subject.id)) {
+      this.starredIds.delete(subject.id)
+      this.lastAnswerFeedback = `☆ Removed ${displaySubject(subject)} from Starred.`
+      this.lessonReviewFeedback = this.lastAnswerFeedback
+    } else {
+      this.starredIds.add(subject.id)
+      this.lastAnswerFeedback = `★ Starred ${displaySubject(subject)}.`
+      this.lessonReviewFeedback = this.lastAnswerFeedback
+    }
+
+    await this.saveStarredSubjects()
+    this.starredSubjects = this.starredSubjects.filter(item => this.starredIds.has(item.id))
+    this.render()
+  }
+
+  private starMark(subject: SubjectResource): string {
+    return this.starredIds.has(subject.id) ? '★' : '☆'
+  }
+
+  private async startStarred(): Promise<void> {
+    if (!this.requireClient()) return
+    if (this.starredIds.size === 0) {
+      this.showMessage('Starred', 'No starred items yet. Swipe up on the first page of a lesson, review, or correction to add one.')
+      return
+    }
+
+    this.showLoading('Loading starred', 'Fetching your saved subjects.')
+    try {
+      const subjectsById = await this.wk!.getSubjects(Array.from(this.starredIds))
+      this.starredSubjects = Array.from(this.starredIds)
+        .map(id => subjectsById[id])
+        .filter((subject): subject is SubjectResource => Boolean(subject))
+      this.starredIndex = Math.min(this.starredIndex, Math.max(0, this.starredSubjects.length - 1))
+      this.starredPage = 0
+      this.mode = 'starred'
+      this.render()
+    } catch (error) {
+      this.showMessage('Starred failed', shortError(error))
+    }
+  }
+
+  private async handleStarredGesture(gesture: Gesture): Promise<void> {
+    if (gesture === 'double') {
+      this.goHome()
+      return
+    }
+
+    const subject = this.starredSubjects[this.starredIndex]
+    if (!subject) {
+      this.goHome()
+      return
+    }
+
+    const pages = this.starredSubjectPages(subject)
+    if (gesture === 'up') {
+      if (this.starredPage === 0) {
+        await this.toggleCurrentSubjectStar()
+        if (this.starredIndex >= this.starredSubjects.length) this.starredIndex = Math.max(0, this.starredSubjects.length - 1)
+      } else {
+        this.starredPage -= 1
+      }
+      this.render()
+      return
+    }
+
+    if (gesture === 'down') {
+      this.starredPage = Math.min(pages.length - 1, this.starredPage + 1)
+      this.render()
+      return
+    }
+
+    if (gesture === 'tap') {
+      this.starredIndex = wrap(this.starredIndex + 1, this.starredSubjects.length)
+      this.starredPage = 0
+      this.render()
+    }
+  }
+
   private goHome(): void {
     this.mode = 'home'
     this.render()
@@ -755,7 +894,7 @@ class WaniPocketApp {
   }
 
   private render(): void {
-    const model = this.view()
+    const model = this.currentPagedView()
     this.display.render(model)
     this.updateCompanion(model)
   }
@@ -767,12 +906,56 @@ class WaniPocketApp {
       case 'loading': return this.loadingView()
       case 'message': return this.messageView()
       case 'help': return this.helpView()
+      case 'starred': return this.starredView()
       case 'reviewQuestion': return this.reviewQuestionView()
       case 'reviewCorrection': return this.reviewCorrectionView()
       case 'lesson': return this.lessonView()
       case 'lessonReviewQuestion': return this.lessonReviewQuestionView()
       case 'lessonCheckpoint': return this.lessonCheckpointView()
     }
+  }
+
+  private currentPagedView(): ViewModel {
+    const raw = this.view()
+    const signature = `${this.mode}|${raw.header}|${raw.footer}|${raw.body}`
+    const pages = this.bodyPages(raw.body)
+    if (signature !== this.viewSignature) {
+      this.viewSignature = signature
+      this.pageIndex = 0
+    }
+    this.pageIndex = Math.min(this.pageIndex, pages.length - 1)
+
+    if (pages.length <= 1) return { ...raw, body: pages[0] || raw.body }
+    return {
+      ...raw,
+      header: `${raw.header} · Page ${this.pageIndex + 1}/${pages.length}`,
+      body: pages[this.pageIndex] || '',
+      footer: `${raw.footer}  ·  Ring: page`,
+    }
+  }
+
+  private handleBodyPageGesture(gesture: 'up' | 'down'): boolean {
+    if (this.mode === 'lesson' || this.mode === 'starred') return false
+    const pages = this.bodyPages(this.view().body)
+    if (pages.length <= 1) return false
+
+    if (gesture === 'up' && this.pageIndex > 0) {
+      this.pageIndex -= 1
+      this.render()
+      return true
+    }
+
+    if (gesture === 'down' && this.pageIndex < pages.length - 1) {
+      this.pageIndex += 1
+      this.render()
+      return true
+    }
+
+    return false
+  }
+
+  private bodyPages(body: string): string[] {
+    return paginateForScreen(body, BODY_PAGE_CHARS, BODY_PAGE_LINES)
   }
 
   private setupView(): ViewModel {
@@ -787,14 +970,24 @@ class WaniPocketApp {
   private homeView(): ViewModel {
     const user = this.dashboard.user?.data
     const actions = this.homeActions()
+    const pageCount = Math.max(1, Math.ceil(actions.length / HOME_PAGE_SIZE))
+    const menuPage = Math.min(pageCount - 1, Math.floor(this.homeIndex / HOME_PAGE_SIZE))
+    const pageStart = menuPage * HOME_PAGE_SIZE
     const menu = actions
-      .map((action, index) => `${index === this.homeIndex ? '▶' : ' '} ${action.label}`)
+      .slice(pageStart, pageStart + HOME_PAGE_SIZE)
+      .map((action, offset) => {
+        const index = pageStart + offset
+        return `${index === this.homeIndex ? '▶' : ' '} ${action.label}`
+      })
       .join('\n')
+    const stats = menuPage === 0
+      ? `\nNext: ${nextReviewLine(this.dashboard.nextReviewsAt)}`
+      : `\nSynced: ${formatTime(this.dashboard.lastSync)}`
 
     return {
-      header: `WaniPocket${user ? ` · ${user.username} L${user.level}` : ''}`,
-      body: `${menu}\n\nNext review: ${nextReviewLine(this.dashboard.nextReviewsAt)}\nSynced: ${formatTime(this.dashboard.lastSync)}`,
-      footer: 'Swipe: move  ·  Tap: select  ·  Double: exit',
+      header: `WaniPocket${user ? ` · ${user.username} L${user.level}` : ''} · Menu ${menuPage + 1}/${pageCount}`,
+      body: `${menu}${stats}`,
+      footer: 'Ring: move page  ·  Tap: select  ·  Double: exit',
     }
   }
 
@@ -817,7 +1010,7 @@ class WaniPocketApp {
   private helpView(): ViewModel {
     return {
       header: 'Controls',
-      body: 'Home:\nSwipe = move menu\nTap = select\nDouble = exit\n\nReviews with keyboard:\nType answer on phone\nEnter = grade\nWrong answer = submitted wrong + shows correct answer\nEnter/tap again = next review\nDouble = home\n\nLessons:\nTap = next / start\nSwipe = page prev/next\nDouble = home',
+      body: 'Home:\nRing = move/menu pages\nTap = select\nDouble = exit\n\nReviews with keyboard:\nType answer on phone\nEnter = grade\nWrong answer = submitted wrong + shows correct answer\nEnter/tap again = next review\nDouble = home\n\nPaging:\nRing scroll = page text\nNo body scrolling\n\nStars:\nRing up on first item page = star/unstar\nHome > Starred = revisit saved items\n\nLessons:\nTap = next / start\nRing down = next page\nRing up = previous page/star on first\nDouble = home',
       footer: 'Tap/Double: home',
     }
   }
@@ -834,7 +1027,7 @@ class WaniPocketApp {
 
     return {
       header: `Review ${count} · ${partLabel}`,
-      body: `${big(displaySubject(subject))}\n${subjectKindLabel(subject)} · Level ${subject.data.level}\n\nMeaning review: ${this.reviewPart === 'meaning' ? 'CURRENT' : 'done'}\nReading review: ${hasReadingQuestion(subject) ? (this.reviewPart === 'reading' ? 'CURRENT' : 'pending') : 'none'}\n\nType ${partLabel}:\n${clip(input, 160)}\n${wrongs}${feedback}`,
+      body: `${big(displaySubject(subject))}\n${this.starMark(subject)} ${subjectKindLabel(subject)} · Level ${subject.data.level}\n\nMeaning review: ${this.reviewPart === 'meaning' ? 'CURRENT' : 'done'}\nReading review: ${hasReadingQuestion(subject) ? (this.reviewPart === 'reading' ? 'CURRENT' : 'pending') : 'none'}\n\nType ${partLabel}:\n${clip(input, 160)}\n${wrongs}${feedback}`,
       footer: 'Phone keyboard: type + Enter  ·  Double: home',
     }
   }
@@ -855,14 +1048,14 @@ ${clip(readings, 220)}
       : stripHtml(subject.data.reading_mnemonic)
     const mnemonicLine = mnemonic ? `
 ${answeredPart} mnemonic:
-${clip(firstUsefulLine(mnemonic, 260), 260)}
+${firstUsefulLine(mnemonic, 4000)}
 ` : ''
     const nextLine = this.reviewIndex >= this.reviewQueue.length ? 'Press Enter/tap to finish.' : `Press Enter/tap for review ${this.reviewIndex + 1}/${this.reviewQueue.length}.`
 
     return {
       header: `Marked wrong · ${answeredPart}`,
       body: `${big(displaySubject(subject))}
-${subjectKindLabel(subject)} · Level ${subject.data.level}
+${this.starMark(subject)} ${subjectKindLabel(subject)} · Level ${subject.data.level}
 
 Your answer:
 ${clip(this.correctionGiven || '—', 140)}
@@ -882,7 +1075,7 @@ ${nextLine}`,
     return {
       header: `Lesson ${this.lessonIndex + 1}/${this.lessonQueue.length} · Page ${this.lessonPage + 1}/${pages.length}`,
       body: pages[this.lessonPage] || '',
-      footer: this.lessonPage === pages.length - 1 ? 'Tap: start lesson  ·  Double: home' : 'Tap/Swipe: next  ·  Double: home',
+      footer: this.lessonPage === pages.length - 1 ? 'Tap: start lesson  ·  Up first page: star  ·  Double: home' : 'Tap/Ring: next  ·  Up first page: star  ·  Double: home',
     }
   }
 
@@ -890,9 +1083,56 @@ ${nextLine}`,
     return [
       { name: 'reviews', label: `Reviews (${this.dashboard.reviewCount})` },
       { name: 'lessons', label: `Lessons (${this.dashboard.lessonCount})` },
+      { name: 'starred', label: `Starred (${this.starredIds.size})` },
       { name: 'refresh', label: 'Refresh now' },
       { name: 'help', label: 'Controls' },
     ]
+  }
+
+  private starredView(): ViewModel {
+    const subject = this.starredSubjects[this.starredIndex]
+    if (!subject) {
+      return {
+        header: 'Starred',
+        body: 'No starred items. Swipe up on the first page of an item to save it here.',
+        footer: 'Double: home',
+      }
+    }
+
+    const pages = this.starredSubjectPages(subject)
+    this.starredPage = Math.min(this.starredPage, pages.length - 1)
+    return {
+      header: `Starred ${this.starredIndex + 1}/${this.starredSubjects.length} · Page ${this.starredPage + 1}/${pages.length}`,
+      body: pages[this.starredPage] || '',
+      footer: 'Tap: next item  ·  Ring: page  ·  Up first page: unstar  ·  Double: home',
+    }
+  }
+
+  private starredSubjectPages(subject: SubjectResource): string[] {
+    const meanings = acceptedMeanings(subject).join(', ') || '—'
+    const readings = acceptedReadings(subject).join(', ') || '—'
+    const pos = subject.data.parts_of_speech?.join(', ')
+    const pages = [
+      `${this.starMark(subject)} ${big(displaySubject(subject))}
+${subjectKindLabel(subject)} · Level ${subject.data.level}
+
+Meaning:
+${meanings}${hasReadingQuestion(subject) ? `
+
+Reading:
+${readings}` : ''}${pos ? `
+
+Part of speech:
+${pos}` : ''}`,
+    ]
+
+    const meaningMnemonic = stripHtml(subject.data.meaning_mnemonic)
+    if (meaningMnemonic) pages.push(...mnemonicPages('Meaning mnemonic', meaningMnemonic))
+
+    const readingMnemonic = stripHtml(subject.data.reading_mnemonic)
+    if (readingMnemonic && hasReadingQuestion(subject)) pages.push(...mnemonicPages('Reading mnemonic', readingMnemonic))
+
+    return pages.flatMap(page => paginateForScreen(page, BODY_PAGE_CHARS, BODY_PAGE_LINES))
   }
 
   private lessonReviewQuestionView(): ViewModel {
@@ -903,7 +1143,7 @@ ${nextLine}`,
     const feedback = this.lessonReviewFeedback ? `\n\n${this.lessonReviewFeedback}` : ''
     return {
       header: `Lesson review ${this.lessonReviewIndex + 1}/${this.lessonReviewQueue.length} · ${partLabel}`,
-      body: `${big(displaySubject(item.subject))}\n${subjectKindLabel(item.subject)} · Level ${item.subject.data.level}\n\nQuestion: ${partLabel}\nTyped: ${clip(input, 160)}${feedback}`,
+      body: `${big(displaySubject(item.subject))}\n${this.starMark(item.subject)} ${subjectKindLabel(item.subject)} · Level ${item.subject.data.level}\n\nQuestion: ${partLabel}\nTyped: ${clip(input, 160)}${feedback}`,
       footer: 'Phone keyboard: type + Enter  ·  Double: stop',
     }
   }
@@ -932,7 +1172,7 @@ ${nextLine}`,
 
     const pages = [
       `${big(displaySubject(subject))}
-${subjectKindLabel(subject)} · Level ${subject.data.level}
+${this.starMark(subject)} ${subjectKindLabel(subject)} · Level ${subject.data.level}
 
 Meaning:
 ${meanings}${pos ? `
@@ -966,7 +1206,7 @@ ${meanings}
 ${readings !== '—' ? readings : ''}
 
 Tap to mark the assignment started.`)
-    return pages
+    return pages.flatMap(page => paginateForScreen(page, BODY_PAGE_CHARS, BODY_PAGE_LINES))
   }
 
   private renderCompanionShell(): void {
@@ -1086,16 +1326,14 @@ Tap to mark the assignment started.`)
       this.clearToken().catch(error => this.showMessage('Clear failed', shortError(error)))
     })
     window.addEventListener('wheel', event => {
-      if (this.mode !== 'home') return
       event.preventDefault()
-      this.handleHomeGesture(event.deltaY >= 0 ? 'down' : 'up').catch(console.error)
+      this.handleGesture(event.deltaY >= 0 ? 'down' : 'up').catch(console.error)
     }, { passive: false })
 
     window.addEventListener('keydown', event => {
-      if (this.mode !== 'home') return
       if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
       event.preventDefault()
-      this.handleHomeGesture(event.key === 'ArrowDown' ? 'down' : 'up').catch(console.error)
+      this.handleGesture(event.key === 'ArrowDown' ? 'down' : 'up').catch(console.error)
     })
   }
 
@@ -1176,7 +1414,7 @@ Tap to mark the assignment started.`)
   private updateLiveAnswerMirror(): void {
     const mirror = document.querySelector<HTMLPreElement>('#mirror')
     if (!mirror) return
-    const model = this.view()
+    const model = this.currentPagedView()
     mirror.textContent = `${model.header}\n\n${model.body}\n\n${model.footer}`
   }
 
@@ -1229,10 +1467,11 @@ function injectStyles(): void {
   const style = document.createElement('style')
   style.id = 'wanipocket-styles'
   style.textContent = `
-    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #080b10; color: #eef4ff; }
-    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at top left, rgba(82, 190, 120, .16), transparent 30rem), #080b10; }
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #080b10; color: #eef4ff; overflow: hidden; overscroll-behavior: none; }
+    html, body { height: 100%; overflow: hidden; overscroll-behavior: none; }
+    body { margin: 0; background: radial-gradient(circle at top left, rgba(82, 190, 120, .16), transparent 30rem), #080b10; }
     button, input { font: inherit; }
-    .shell { width: min(980px, calc(100vw - 32px)); margin: 0 auto; padding: 32px 0 56px; }
+    .shell { width: min(980px, calc(100vw - 32px)); height: 100vh; margin: 0 auto; padding: 32px 0 56px; box-sizing: border-box; overflow: hidden; }
     .hero { display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; margin-bottom: 18px; }
     .eyebrow { color: #7ee787; text-transform: uppercase; letter-spacing: .12em; font-size: .78rem; margin: 0 0 8px; }
     h1 { font-size: clamp(2.2rem, 8vw, 5rem); line-height: .9; margin: 0 0 12px; }
@@ -1303,11 +1542,33 @@ function nextReviewLine(iso: string | null): string {
 }
 
 function mnemonicPages(title: string, text: string): string[] {
-  return paginateText(firstUsefulLine(text, 2000), 330).map((chunk, index, chunks) => {
+  return paginateForScreen(firstUsefulLine(text, 2000), BODY_PAGE_CHARS, BODY_PAGE_LINES).map((chunk, index, chunks) => {
     const pageLabel = chunks.length > 1 ? ` (${index + 1}/${chunks.length})` : ''
     return `${title}${pageLabel}:
 ${chunk}`
   })
+}
+
+function paginateForScreen(text: string, maxChars: number, maxLines: number): string[] {
+  const charPages = paginateText(text, maxChars)
+  return charPages.flatMap(page => paginateByLines(page, maxLines))
+}
+
+function paginateByLines(text: string, maxLines: number): string[] {
+  const lines = text.split('\n')
+  const pages: string[] = []
+  let current: string[] = []
+
+  for (const line of lines) {
+    if (current.length >= maxLines) {
+      pages.push(current.join('\n').trim())
+      current = []
+    }
+    current.push(line)
+  }
+
+  if (current.length) pages.push(current.join('\n').trim())
+  return pages.filter(Boolean).length ? pages.filter(Boolean) : ['—']
 }
 
 function paginateText(text: string, maxChars: number): string[] {
