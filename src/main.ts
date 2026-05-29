@@ -62,55 +62,63 @@ class G2Display {
   async boot(initial: ViewModel): Promise<void> {
     if (!this.bridge) return
 
-    const created = await this.bridge.createStartUpPageContainer(
-      new CreateStartUpPageContainer({
-        containerTotalNum: 3,
-        textObject: [
-          new TextContainerProperty({
-            xPosition: 0,
-            yPosition: 0,
-            width: 576,
-            height: 36,
-            borderWidth: 0,
-            borderColor: 10,
-            borderRadius: 0,
-            paddingLength: 4,
-            containerID: HEADER_ID,
-            containerName: 'header',
-            content: clip(initial.header, 900),
-            isEventCapture: 0,
-          }),
-          new TextContainerProperty({
-            xPosition: 0,
-            yPosition: 38,
-            width: 576,
-            height: 208,
-            borderWidth: 1,
-            borderColor: 7,
-            borderRadius: 8,
-            paddingLength: 6,
-            containerID: BODY_ID,
-            containerName: 'body',
-            content: clip(initial.body, 900),
-            isEventCapture: 1,
-          }),
-          new TextContainerProperty({
-            xPosition: 0,
-            yPosition: 250,
-            width: 576,
-            height: 38,
-            borderWidth: 0,
-            borderColor: 10,
-            borderRadius: 0,
-            paddingLength: 4,
-            containerID: FOOTER_ID,
-            containerName: 'footer',
-            content: clip(initial.footer, 900),
-            isEventCapture: 0,
-          }),
-        ],
+    const textObject = [
+      new TextContainerProperty({
+        xPosition: 0,
+        yPosition: 0,
+        width: 576,
+        height: 36,
+        borderWidth: 0,
+        borderColor: 10,
+        borderRadius: 0,
+        paddingLength: 4,
+        containerID: HEADER_ID,
+        containerName: 'header',
+        content: clip(initial.header, 900),
+        isEventCapture: 0,
       }),
-    )
+      new TextContainerProperty({
+        xPosition: 0,
+        yPosition: 38,
+        width: 576,
+        height: 208,
+        borderWidth: 1,
+        borderColor: 7,
+        borderRadius: 8,
+        paddingLength: 6,
+        containerID: BODY_ID,
+        containerName: 'body',
+        content: clip(initial.body, 900),
+        isEventCapture: 1,
+      }),
+      new TextContainerProperty({
+        xPosition: 0,
+        yPosition: 250,
+        width: 576,
+        height: 38,
+        borderWidth: 0,
+        borderColor: 10,
+        borderRadius: 0,
+        paddingLength: 4,
+        containerID: FOOTER_ID,
+        containerName: 'footer',
+        content: clip(initial.footer, 900),
+        isEventCapture: 0,
+      }),
+    ]
+
+    let created: number
+    try {
+      created = await this.bridge.createStartUpPageContainer(
+        new CreateStartUpPageContainer({
+          containerTotalNum: textObject.length,
+          textObject,
+        }),
+      )
+    } catch (error) {
+      console.warn('Even G2 container creation failed; companion UI will continue in browser/simulator mode.', error)
+      return
+    }
 
     if (created !== 0) console.error('createStartUpPageContainer failed:', created)
   }
@@ -134,7 +142,11 @@ class G2Display {
 
   async shutdown(): Promise<void> {
     if (!this.bridge) return
-    await this.bridge.shutDownPageContainer(1)
+    try {
+      await this.bridge.shutDownPageContainer(1)
+    } catch (error) {
+      console.warn('Even G2 container shutdown failed; ignoring because the app is already exiting.', error)
+    }
   }
 }
 
@@ -176,8 +188,12 @@ class WaniPocketApp {
     this.renderCompanionShell()
 
     if (this.bridge) {
-      this.unsubscribe = this.bridge.onEvenHubEvent(event => this.handleEvenHubEvent(event))
-      window.addEventListener('beforeunload', () => this.cleanup())
+      try {
+        this.unsubscribe = this.bridge.onEvenHubEvent(event => this.handleEvenHubEvent(event))
+        window.addEventListener('beforeunload', () => this.cleanup())
+      } catch (error) {
+        console.warn('Even G2 event subscription failed; touch gestures will be unavailable in this environment.', error)
+      }
     }
 
     this.token = (await this.store.get(TOKEN_KEY)).trim()
@@ -873,16 +889,16 @@ ${nextLine}`,
     })
 
     answerInput?.addEventListener('keydown', event => {
-  const isImeKey =
-    this.isComposingAnswer ||
-    event.isComposing ||
-    event.key === 'Process' ||
-    event.keyCode === 229
+      const isImeKey =
+        this.isComposingAnswer ||
+        event.isComposing ||
+        event.key === 'Process' ||
+        event.keyCode === 229
 
-  if (event.key === 'Enter' && isImeKey) {
-    this.ignoreNextAnswerSubmit = true
-  }
-})
+      if (event.key === 'Enter' && isImeKey) {
+        this.ignoreNextAnswerSubmit = true
+      }
+    })
 
     document.querySelector<HTMLFormElement>('#tokenForm')?.addEventListener('submit', event => {
       event.preventDefault()
