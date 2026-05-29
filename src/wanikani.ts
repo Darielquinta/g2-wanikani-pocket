@@ -306,7 +306,18 @@ export function hasReadingQuestion(subject: SubjectResource): boolean {
 }
 
 export function displaySubject(subject: SubjectResource): string {
+  if (subject.object === 'radical') return displayRadicalSubject(subject)
   return subject.data.characters || subject.data.slug || `[${subject.object}]`
+}
+
+function displayRadicalSubject(subject: SubjectResource): string {
+  const characters = subject.data.characters
+  if (characters && !hasSupplementaryCodePoint(characters)) return characters
+  return subject.data.slug || characters || '[radical]'
+}
+
+function hasSupplementaryCodePoint(text: string): boolean {
+  return Array.from(text).some(char => (char.codePointAt(0) || 0) > 0xffff)
 }
 
 export function subjectKindLabel(subject: SubjectResource): string {
@@ -330,14 +341,27 @@ export function stripHtml(input: string | undefined): string {
 
 export function meaningMatches(answer: string, item: StudyItem): boolean {
   const guess = normalizeMeaning(answer)
-  if (!guess) return false
-  return acceptedMeanings(item.subject, item.studyMaterial).some(candidate => normalizeMeaning(candidate) === guess)
+  if (!guess || isBlacklistedMeaning(guess, item.subject)) return false
+
+  return acceptedMeanings(item.subject, item.studyMaterial).some(candidate => {
+    const normalized = normalizeMeaning(candidate)
+    return normalized === guess || isLikelyTypo(guess, normalized)
+  })
+}
+
+function isBlacklistedMeaning(guess: string, subject: SubjectResource): boolean {
+  return (subject.data.auxiliary_meanings || [])
+    .filter(item => item.type === 'blacklist')
+    .some(item => normalizeMeaning(item.meaning) === guess)
 }
 
 export function readingMatches(answer: string, subject: SubjectResource): boolean {
   const guess = normalizeReading(answer)
   if (!guess) return false
-  return acceptedReadings(subject).some(candidate => normalizeReading(candidate) === guess)
+  return acceptedReadings(subject).some(candidate => {
+    const normalized = normalizeReading(candidate)
+    return normalized === guess || isLikelyTypo(guess, normalized)
+  })
 }
 
 export function normalizeMeaning(input: string): string {
@@ -356,9 +380,9 @@ export function normalizeReading(input: string): string {
     .replace(/[\s\-・ー]/g, '')
 }
 
-export function toHiragana(input: string): string {
+export function toHiragana(input: string, options: { finalizeN?: boolean } = {}): string {
   const kana = katakanaToHiragana(input.normalize('NFKC').toLocaleLowerCase())
-  return romajiToHiragana(expandRomajiLongVowels(kana))
+  return romajiToHiragana(expandRomajiLongVowels(kana), options.finalizeN !== false)
 }
 
 export function shortError(error: unknown): string {
@@ -373,11 +397,43 @@ export function shortError(error: unknown): string {
   return 'Unknown error.'
 }
 
+function isLikelyTypo(guess: string, expected: string): boolean {
+  if (!guess || !expected || guess === expected) return false
+  const minLength = Math.min(guess.length, expected.length)
+  if (minLength < 4) return false
+  const maxDistance = minLength >= 8 ? 2 : 1
+  return levenshteinAtMost(guess, expected, maxDistance)
+}
+
+function levenshteinAtMost(a: string, b: string, maxDistance: number): boolean {
+  if (Math.abs(a.length - b.length) > maxDistance) return false
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index)
+
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i]
+    let rowMin = current[0]
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1
+      const value = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + cost,
+      )
+      current[j] = value
+      rowMin = Math.min(rowMin, value)
+    }
+    if (rowMin > maxDistance) return false
+    previous = current
+  }
+
+  return previous[b.length] <= maxDistance
+}
+
 function katakanaToHiragana(input: string): string {
   return input.replace(/[ァ-ン]/g, char => String.fromCharCode(char.charCodeAt(0) - 0x60))
 }
 
-function romajiToHiragana(input: string): string {
+function romajiToHiragana(input: string, finalizeN: boolean): string {
   const table: Record<string, string> = {
     a: 'あ', i: 'い', u: 'う', e: 'え', o: 'お',
     ka: 'か', ki: 'き', ku: 'く', ke: 'け', ko: 'こ',
@@ -427,7 +483,18 @@ function romajiToHiragana(input: string): string {
 
     if (char === 'n') {
       const following = input[i + 1]
-      if (!following || following === "'" || !/[aeiouy]/.test(following)) {
+      const afterFollowing = input[i + 2]
+      if (!following && !finalizeN) {
+        out += 'n'
+        i += 1
+        continue
+      }
+      if (following === 'n' && !afterFollowing) {
+        out += 'ん'
+        i += 2
+        continue
+      }
+      if ((finalizeN || following) && (!following || following === "'" || !/[aeiouy]/.test(following))) {
         out += 'ん'
         i += following === "'" ? 2 : 1
         continue

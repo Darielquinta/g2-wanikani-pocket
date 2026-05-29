@@ -2,6 +2,7 @@ import type { EvenAppBridge } from '@evenrealities/even_hub_sdk'
 
 export const TOKEN_KEY = 'wanipocket.wkToken.v1'
 export const SUBJECT_CACHE_KEY = 'wanipocket.subjectCache.v1'
+export const STARRED_SUBJECTS_KEY = 'wanipocket.starredSubjects.v1'
 
 export class PersistStore {
   constructor(private bridge: EvenAppBridge | null) {}
