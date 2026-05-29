@@ -310,13 +310,9 @@ export function displaySubject(subject: SubjectResource): string {
   return subject.data.characters || subject.data.slug || `[${subject.object}]`
 }
 
-export function radicalDisplayUnavailable(subject: SubjectResource): boolean {
-  return subject.object === 'radical' && (!subject.data.characters || hasSupplementaryCodePoint(subject.data.characters))
-}
-
 function displayRadicalSubject(subject: SubjectResource): string {
   const characters = subject.data.characters
-  if (!radicalDisplayUnavailable(subject)) return characters || subject.data.slug || '[radical]'
+  if (characters && !hasSupplementaryCodePoint(characters)) return characters
   return subject.data.slug || characters || '[radical]'
 }
 
