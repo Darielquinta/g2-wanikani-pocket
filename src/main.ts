@@ -49,7 +49,9 @@ interface ViewModel {
 const HEADER_ID = 1
 const BODY_ID = 2
 const FOOTER_ID = 3
-const BODY_PAGE_CHARS = 330
+const BODY_PAGE_CHARS = 220
+const BODY_PAGE_LINES = 7
+const HOME_PAGE_SIZE = 3
 const EMPTY_DASHBOARD: Dashboard = {
   user: null,
   reviewCount: 0,
@@ -405,8 +407,16 @@ class WaniPocketApp {
 
     try {
       const loadedReviews = await this.wk!.getStudyItems('reviews', 50)
-      const skippedRadicals = loadedReviews.filter(item => radicalDisplayUnavailable(item.subject)).length
-      this.reviewQueue = loadedReviews.filter(item => !radicalDisplayUnavailable(item.subject))
+      const reviewableItems: StudyItem[] = []
+      let skippedRadicals = 0
+      for (const item of loadedReviews) {
+        if (radicalDisplayUnavailable(item.subject)) {
+          skippedRadicals += 1
+        } else {
+          reviewableItems.push(item)
+        }
+      }
+      this.reviewQueue = reviewableItems
       this.reviewIndex = 0
       this.correctionItem = null
       this.resetReviewAttempt(skippedRadicals
@@ -933,7 +943,7 @@ class WaniPocketApp {
   }
 
   private handleBodyPageGesture(gesture: 'up' | 'down'): boolean {
-    if (this.mode === 'home' || this.mode === 'lesson' || this.mode === 'starred') return false
+    if (this.mode === 'lesson' || this.mode === 'starred') return false
     const pages = this.bodyPages(this.view().body)
     if (pages.length <= 1) return false
 
@@ -953,7 +963,7 @@ class WaniPocketApp {
   }
 
   private bodyPages(body: string): string[] {
-    return paginateText(body, BODY_PAGE_CHARS)
+    return paginateForScreen(body, BODY_PAGE_CHARS, BODY_PAGE_LINES)
   }
 
   private setupView(): ViewModel {
@@ -1008,7 +1018,7 @@ class WaniPocketApp {
   private helpView(): ViewModel {
     return {
       header: 'Controls',
-      body: 'Home:\nSwipe = move menu\nTap = select\nDouble = exit\n\nReviews with keyboard:\nType answer on phone\nEnter = grade\nWrong answer = submitted wrong + shows correct answer\nEnter/tap again = next review\nDouble = home\n\nPaging:\nRing scroll = page text\nNo body scrolling\n\nStars:\nSwipe up on first item page = star/unstar\nHome > Starred = revisit saved items\n\nLessons:\nTap = next / start\nSwipe down = next page\nSwipe up = previous page/star on first\nDouble = home',
+      body: 'Home:\nRing = move/menu pages\nTap = select\nDouble = exit\n\nReviews with keyboard:\nType answer on phone\nEnter = grade\nWrong answer = submitted wrong + shows correct answer\nEnter/tap again = next review\nDouble = home\n\nPaging:\nRing scroll = page text\nNo body scrolling\n\nStars:\nRing up on first item page = star/unstar\nHome > Starred = revisit saved items\n\nLessons:\nTap = next / start\nRing down = next page\nRing up = previous page/star on first\nDouble = home',
       footer: 'Tap/Double: home',
     }
   }
@@ -1073,7 +1083,7 @@ ${nextLine}`,
     return {
       header: `Lesson ${this.lessonIndex + 1}/${this.lessonQueue.length} · Page ${this.lessonPage + 1}/${pages.length}`,
       body: pages[this.lessonPage] || '',
-      footer: this.lessonPage === pages.length - 1 ? 'Tap: start lesson  ·  Up first page: star  ·  Double: home' : 'Tap/Swipe: next  ·  Up first page: star  ·  Double: home',
+      footer: this.lessonPage === pages.length - 1 ? 'Tap: start lesson  ·  Up first page: star  ·  Double: home' : 'Tap/Ring: next  ·  Up first page: star  ·  Double: home',
     }
   }
 
@@ -1102,7 +1112,7 @@ ${nextLine}`,
     return {
       header: `Starred ${this.starredIndex + 1}/${this.starredSubjects.length} · Page ${this.starredPage + 1}/${pages.length}`,
       body: pages[this.starredPage] || '',
-      footer: 'Tap: next item  ·  Swipe: page  ·  Up first page: unstar  ·  Double: home',
+      footer: 'Tap: next item  ·  Ring: page  ·  Up first page: unstar  ·  Double: home',
     }
   }
 
@@ -1130,7 +1140,7 @@ ${pos}` : ''}`,
     const readingMnemonic = stripHtml(subject.data.reading_mnemonic)
     if (readingMnemonic && hasReadingQuestion(subject)) pages.push(...mnemonicPages('Reading mnemonic', readingMnemonic))
 
-    return pages.flatMap(page => paginateText(page, BODY_PAGE_CHARS))
+    return pages.flatMap(page => paginateForScreen(page, BODY_PAGE_CHARS, BODY_PAGE_LINES))
   }
 
   private lessonReviewQuestionView(): ViewModel {
@@ -1204,7 +1214,7 @@ ${meanings}
 ${readings !== '—' ? readings : ''}
 
 Tap to mark the assignment started.`)
-    return pages.flatMap(page => paginateText(page, BODY_PAGE_CHARS))
+    return pages.flatMap(page => paginateForScreen(page, BODY_PAGE_CHARS, BODY_PAGE_LINES))
   }
 
   private renderCompanionShell(): void {
