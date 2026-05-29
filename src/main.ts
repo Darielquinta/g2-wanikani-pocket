@@ -19,13 +19,14 @@ import {
   shortError,
   stripHtml,
   subjectKindLabel,
+  toHiragana,
   type StudyItem,
   type UserData,
   type WkResource,
 } from './wanikani'
 
 type Gesture = 'tap' | 'up' | 'down' | 'double'
-type Mode = 'setup' | 'home' | 'loading' | 'message' | 'help' | 'reviewQuestion' | 'reviewCorrection' | 'lesson'
+type Mode = 'setup' | 'home' | 'loading' | 'message' | 'help' | 'reviewQuestion' | 'reviewCorrection' | 'lesson' | 'lessonReviewQuestion' | 'lessonCheckpoint'
 type ActionName = 'reviews' | 'lessons' | 'refresh' | 'help'
 type ReviewPart = 'meaning' | 'reading'
 
@@ -56,6 +57,8 @@ const EMPTY_DASHBOARD: Dashboard = {
 
 class G2Display {
   private renderQueue: Promise<void> = Promise.resolve()
+  private pendingModel: ViewModel | null = null
+  private isRendering = false
 
   constructor(private bridge: EvenAppBridge | null) {}
 
@@ -117,19 +120,31 @@ class G2Display {
 
   render(model: ViewModel): void {
     if (!this.bridge) return
+    this.pendingModel = model
+    if (this.isRendering) return
+
+    this.isRendering = true
     this.renderQueue = this.renderQueue
       .then(async () => {
-        await this.bridge!.textContainerUpgrade(
-          new TextContainerUpgrade({ containerID: HEADER_ID, containerName: 'header', content: clip(model.header, 1900) }),
-        )
-        await this.bridge!.textContainerUpgrade(
-          new TextContainerUpgrade({ containerID: BODY_ID, containerName: 'body', content: clip(model.body, 1900) }),
-        )
-        await this.bridge!.textContainerUpgrade(
-          new TextContainerUpgrade({ containerID: FOOTER_ID, containerName: 'footer', content: clip(model.footer, 1900) }),
-        )
+        while (this.pendingModel) {
+          const next = this.pendingModel
+          this.pendingModel = null
+          await this.bridge!.textContainerUpgrade(
+            new TextContainerUpgrade({ containerID: HEADER_ID, containerName: 'header', content: clip(next.header, 1900) }),
+          )
+          await this.bridge!.textContainerUpgrade(
+            new TextContainerUpgrade({ containerID: BODY_ID, containerName: 'body', content: clip(next.body, 1900) }),
+          )
+          await this.bridge!.textContainerUpgrade(
+            new TextContainerUpgrade({ containerID: FOOTER_ID, containerName: 'footer', content: clip(next.footer, 1900) }),
+          )
+        }
       })
       .catch(error => console.error('render failed:', error))
+      .finally(() => {
+        this.isRendering = false
+        if (this.pendingModel) this.render(this.pendingModel)
+      })
   }
 
   async shutdown(): Promise<void> {
@@ -162,6 +177,12 @@ class WaniPocketApp {
   private lessonQueue: StudyItem[] = []
   private lessonIndex = 0
   private lessonPage = 0
+  private lessonReviewQueue: StudyItem[] = []
+  private lessonReviewIndex = 0
+  private lessonReviewPart: ReviewPart = 'meaning'
+  private lessonReviewFeedback = ''
+  private lessonReviewBatchStart = 0
+  private typingRenderTimer: number | null = null
   private unsubscribe: (() => void) | null = null
 
   constructor(
@@ -243,6 +264,14 @@ class WaniPocketApp {
       case 'reviewQuestion':
         if (gesture === 'double') this.goHome()
         if (gesture === 'tap') this.focusAnswerInput()
+        break
+      case 'lessonReviewQuestion':
+        if (gesture === 'double') this.showLessonCheckpoint()
+        if (gesture === 'tap') this.focusAnswerInput()
+        break
+      case 'lessonCheckpoint':
+        if (gesture === 'double') this.goHome()
+        else if (gesture === 'tap') this.continueLessonsAfterCheckpoint()
         break
       case 'reviewCorrection':
         if (gesture === 'double') this.goHome()
@@ -377,6 +406,9 @@ class WaniPocketApp {
       this.lessonQueue = await this.wk!.getStudyItems('lessons', 25)
       this.lessonIndex = 0
       this.lessonPage = 0
+      this.lessonReviewQueue = []
+      this.lessonReviewIndex = 0
+      this.lessonReviewBatchStart = 0
 
       if (this.lessonQueue.length === 0) {
         this.showMessage('No lessons', 'Nothing unlocked right now. Suspiciously peaceful.')
@@ -392,6 +424,11 @@ class WaniPocketApp {
 
   async submitTypedAnswer(answer: string): Promise<void> {
     if (this.isComposingAnswer) return
+
+    if (this.mode === 'lessonReviewQuestion') {
+      await this.submitLessonReviewAnswer(answer)
+      return
+    }
 
     if (this.mode === 'reviewCorrection') {
       this.liveAnswer = ''
@@ -447,8 +484,12 @@ class WaniPocketApp {
   }
 
   updateLiveAnswer(answer: string): void {
-    this.liveAnswer = answer
-    if (this.mode === 'reviewQuestion') this.render()
+    const value = this.shouldKanaInput() ? toHiragana(answer) : answer
+    this.liveAnswer = value
+    const input = document.querySelector<HTMLInputElement>('#answerInput')
+    if (input && input.value !== value) input.value = value
+    this.updateLiveAnswerMirror()
+    if (this.mode === 'reviewQuestion' || this.mode === 'lessonReviewQuestion') this.scheduleTypingRender()
   }
 
   private async submitCompletedReview(): Promise<void> {
@@ -531,6 +572,91 @@ class WaniPocketApp {
     this.render()
   }
 
+
+  private async submitLessonReviewAnswer(answer: string): Promise<void> {
+    const item = this.lessonReviewQueue[this.lessonReviewIndex]
+    if (!item) return
+
+    const trimmed = answer.trim()
+    if (!trimmed) {
+      this.lessonReviewFeedback = 'Type an answer first.'
+      this.render()
+      return
+    }
+
+    const correct = this.lessonReviewPart === 'meaning'
+      ? meaningMatches(trimmed, item)
+      : readingMatches(trimmed, item.subject)
+
+    if (!correct) {
+      const expected = this.lessonReviewPart === 'meaning'
+        ? acceptedMeanings(item.subject, item.studyMaterial).join(', ')
+        : acceptedReadings(item.subject).join(', ')
+      this.lessonReviewFeedback = `Try again. Correct ${this.lessonReviewPart}: ${clip(expected || '—', 140)}`
+      this.liveAnswer = ''
+      this.setAnswerInput('')
+      this.render()
+      return
+    }
+
+    this.liveAnswer = ''
+    this.setAnswerInput('')
+
+    if (this.lessonReviewPart === 'meaning' && hasReadingQuestion(item.subject)) {
+      this.lessonReviewPart = 'reading'
+      this.lessonReviewFeedback = '✓ Meaning correct. Now type the reading.'
+      this.render()
+      return
+    }
+
+    this.lessonReviewIndex += 1
+    this.lessonReviewPart = 'meaning'
+    this.lessonReviewFeedback = '✓ Correct.'
+
+    if (this.lessonReviewIndex >= this.lessonReviewQueue.length) {
+      this.showLessonCheckpoint()
+      return
+    }
+
+    this.render()
+  }
+
+  private shouldStartLessonReview(): boolean {
+    return this.lessonIndex > 0 && this.lessonIndex % 5 === 0
+  }
+
+  private startLessonReviewBatch(): void {
+    this.lessonReviewBatchStart = Math.max(0, this.lessonIndex - 5)
+    this.lessonReviewQueue = shuffleArray(this.lessonQueue.slice(this.lessonReviewBatchStart, this.lessonIndex))
+    this.lessonReviewIndex = 0
+    this.lessonReviewPart = 'meaning'
+    this.lessonReviewFeedback = 'Review the five lesson items you just learned.'
+    this.liveAnswer = ''
+    this.setAnswerInput('')
+    this.mode = 'lessonReviewQuestion'
+    this.render()
+  }
+
+  private showLessonCheckpoint(): void {
+    this.liveAnswer = ''
+    this.setAnswerInput('')
+    this.mode = 'lessonCheckpoint'
+    this.render()
+  }
+
+  private continueLessonsAfterCheckpoint(): void {
+    this.lessonReviewQueue = []
+    this.lessonReviewIndex = 0
+    this.lessonReviewFeedback = ''
+    if (this.lessonIndex >= this.lessonQueue.length) {
+      this.showMessage('Lessons done', 'Started all lessons in this batch. Memory palace construction begins, apparently.')
+      return
+    }
+    this.mode = 'lesson'
+    this.lessonPage = 0
+    this.render()
+  }
+
   private async startLessonAssignment(): Promise<void> {
     const item = this.currentLesson()
     if (!item || !this.wk) return
@@ -541,6 +667,11 @@ class WaniPocketApp {
       this.lessonIndex += 1
       this.lessonPage = 0
       this.dashboard.lessonCount = Math.max(0, this.dashboard.lessonCount - 1)
+
+      if (this.shouldStartLessonReview()) {
+        this.startLessonReviewBatch()
+        return
+      }
 
       if (this.lessonIndex >= this.lessonQueue.length) {
         this.showMessage('Lessons done', 'Started all lessons in this batch. Memory palace construction begins, apparently.')
@@ -639,6 +770,8 @@ class WaniPocketApp {
       case 'reviewQuestion': return this.reviewQuestionView()
       case 'reviewCorrection': return this.reviewCorrectionView()
       case 'lesson': return this.lessonView()
+      case 'lessonReviewQuestion': return this.lessonReviewQuestionView()
+      case 'lessonCheckpoint': return this.lessonCheckpointView()
     }
   }
 
@@ -660,7 +793,7 @@ class WaniPocketApp {
 
     return {
       header: `WaniPocket${user ? ` · ${user.username} L${user.level}` : ''}`,
-      body: `${menu}\n\nKeyboard review mode is ready. Start reviews, then type on the phone.\n\nNext review: ${nextReviewLine(this.dashboard.nextReviewsAt)}\nSynced: ${formatTime(this.dashboard.lastSync)}`,
+      body: `${menu}\n\nNext review: ${nextReviewLine(this.dashboard.nextReviewsAt)}\nSynced: ${formatTime(this.dashboard.lastSync)}`,
       footer: 'Swipe: move  ·  Tap: select  ·  Double: exit',
     }
   }
@@ -701,7 +834,7 @@ class WaniPocketApp {
 
     return {
       header: `Review ${count} · ${partLabel}`,
-      body: `${big(displaySubject(subject))}\n${subjectKindLabel(subject)} · Level ${subject.data.level}\n\nQuestion: ${partLabel}\nTyped: ${clip(input, 160)}\n${wrongs}${feedback}`,
+      body: `${big(displaySubject(subject))}\n${subjectKindLabel(subject)} · Level ${subject.data.level}\n\nMeaning review: ${this.reviewPart === 'meaning' ? 'CURRENT' : 'done'}\nReading review: ${hasReadingQuestion(subject) ? (this.reviewPart === 'reading' ? 'CURRENT' : 'pending') : 'none'}\n\nType ${partLabel}:\n${clip(input, 160)}\n${wrongs}${feedback}`,
       footer: 'Phone keyboard: type + Enter  ·  Double: home',
     }
   }
@@ -715,7 +848,14 @@ class WaniPocketApp {
     const readings = acceptedReadings(subject).join(', ') || '—'
     const readingLine = hasReadingQuestion(subject) ? `
 Correct reading:
-${clip(readings, 260)}
+${clip(readings, 220)}
+` : ''
+    const mnemonic = this.correctionPart === 'meaning'
+      ? stripHtml(subject.data.meaning_mnemonic)
+      : stripHtml(subject.data.reading_mnemonic)
+    const mnemonicLine = mnemonic ? `
+${answeredPart} mnemonic:
+${clip(firstUsefulLine(mnemonic, 260), 260)}
 ` : ''
     const nextLine = this.reviewIndex >= this.reviewQueue.length ? 'Press Enter/tap to finish.' : `Press Enter/tap for review ${this.reviewIndex + 1}/${this.reviewQueue.length}.`
 
@@ -725,11 +865,11 @@ ${clip(readings, 260)}
 ${subjectKindLabel(subject)} · Level ${subject.data.level}
 
 Your answer:
-${clip(this.correctionGiven || '—', 180)}
+${clip(this.correctionGiven || '—', 140)}
 
 Correct meaning:
-${clip(meanings, 260)}
-${readingLine}
+${clip(meanings, 220)}
+${readingLine}${mnemonicLine}
 ${nextLine}`,
       footer: 'Enter/tap: next  ·  Double: home',
     }
@@ -755,6 +895,28 @@ ${nextLine}`,
     ]
   }
 
+  private lessonReviewQuestionView(): ViewModel {
+    const item = this.lessonReviewQueue[this.lessonReviewIndex]
+    if (!item) return this.lessonCheckpointView()
+    const partLabel = this.lessonReviewPart === 'meaning' ? 'Meaning' : 'Reading'
+    const input = this.liveAnswer || '…'
+    const feedback = this.lessonReviewFeedback ? `\n\n${this.lessonReviewFeedback}` : ''
+    return {
+      header: `Lesson review ${this.lessonReviewIndex + 1}/${this.lessonReviewQueue.length} · ${partLabel}`,
+      body: `${big(displaySubject(item.subject))}\n${subjectKindLabel(item.subject)} · Level ${item.subject.data.level}\n\nQuestion: ${partLabel}\nTyped: ${clip(input, 160)}${feedback}`,
+      footer: 'Phone keyboard: type + Enter  ·  Double: stop',
+    }
+  }
+
+  private lessonCheckpointView(): ViewModel {
+    const remaining = Math.max(0, this.lessonQueue.length - this.lessonIndex)
+    return {
+      header: 'Lesson checkpoint',
+      body: `Reviewed the last ${this.lessonReviewQueue.length || Math.min(5, this.lessonIndex - this.lessonReviewBatchStart)} lesson items.\n\nRemaining lessons in this batch: ${remaining}\n\nTap to continue lessons, or double tap to stop and return home.`,
+      footer: 'Tap: continue  ·  Double: stop',
+    }
+  }
+
   private lessonPages(item: StudyItem): string[] {
     const subject = item.subject
     const meanings = acceptedMeanings(subject, item.studyMaterial).join(', ') || '—'
@@ -762,22 +924,48 @@ ${nextLine}`,
     const pos = subject.data.parts_of_speech?.join(', ')
     const meaningMnemonic = stripHtml(subject.data.meaning_mnemonic)
     const readingMnemonic = stripHtml(subject.data.reading_mnemonic)
+    const radicals = subject.object === 'kanji'
+      ? (item.componentSubjects || [])
+        .filter(component => component.object === 'radical')
+        .map(component => `${displaySubject(component)} ${acceptedMeanings(component).slice(0, 2).join('/') || component.data.slug}`)
+      : []
 
     const pages = [
-      `${big(displaySubject(subject))}\n${subjectKindLabel(subject)} · Level ${subject.data.level}\n\nMeaning:\n${meanings}${pos ? `\n\nPart of speech:\n${pos}` : ''}`,
+      `${big(displaySubject(subject))}
+${subjectKindLabel(subject)} · Level ${subject.data.level}
+
+Meaning:
+${meanings}${pos ? `
+
+Part of speech:
+${pos}` : ''}`,
     ]
 
-    if (hasReadingQuestion(subject)) {
-      pages.push(`${big(displaySubject(subject))}\nReading:\n${readings}`)
+    if (radicals.length) {
+      pages.push(`${big(displaySubject(subject))}
+Radicals:
+${paginateLines(radicals, 360).join('\n')}`)
     }
 
-    pages.push(`Meaning mnemonic:\n${firstUsefulLine(meaningMnemonic, 330) || 'No mnemonic returned.'}`)
+    if (hasReadingQuestion(subject)) {
+      pages.push(`${big(displaySubject(subject))}
+Reading:
+${readings}`)
+    }
+
+    pages.push(...mnemonicPages('Meaning mnemonic', meaningMnemonic || 'No mnemonic returned.'))
 
     if (readingMnemonic && hasReadingQuestion(subject)) {
-      pages.push(`Reading mnemonic:\n${firstUsefulLine(readingMnemonic, 330)}`)
+      pages.push(...mnemonicPages('Reading mnemonic', readingMnemonic))
     }
 
-    pages.push(`Ready to start this lesson in WaniKani?\n\n${big(displaySubject(subject))}\n${meanings}\n${readings !== '—' ? readings : ''}\n\nTap to mark the assignment started.`)
+    pages.push(`Ready to start this lesson in WaniKani?
+
+${big(displaySubject(subject))}
+${meanings}
+${readings !== '—' ? readings : ''}
+
+Tap to mark the assignment started.`)
     return pages
   }
 
@@ -800,12 +988,12 @@ ${nextLine}`,
           <div class="card-head">
             <div>
               <h2>Review answer</h2>
-              <p class="muted small" id="answerHelp">Start reviews, then type here. Enter grades or continues after a wrong answer.</p>
+              <p class="muted small" id="answerHelp">Start reviews or lesson review, then type here. Reading answers convert romaji to kana as you type.</p>
             </div>
             <div class="mode-pill" id="answerMode">Idle</div>
           </div>
           <form id="answerForm" class="answer-row">
-            <input id="answerInput" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Start Reviews, then type answer" />
+            <input id="answerInput" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" inputmode="text" lang="ja" placeholder="Start Reviews, then type answer" />
             <button type="submit">Enter</button>
           </form>
           <p class="feedback" id="answerFeedback"></p>
@@ -873,16 +1061,16 @@ ${nextLine}`,
     })
 
     answerInput?.addEventListener('keydown', event => {
-  const isImeKey =
-    this.isComposingAnswer ||
-    event.isComposing ||
-    event.key === 'Process' ||
-    event.keyCode === 229
+      const isImeKey =
+        this.isComposingAnswer ||
+        event.isComposing ||
+        event.key === 'Process' ||
+        event.keyCode === 229
 
-  if (event.key === 'Enter' && isImeKey) {
-    this.ignoreNextAnswerSubmit = true
-  }
-})
+      if (event.key === 'Enter' && isImeKey) {
+        this.ignoreNextAnswerSubmit = true
+      }
+    })
 
     document.querySelector<HTMLFormElement>('#tokenForm')?.addEventListener('submit', event => {
       event.preventDefault()
@@ -896,6 +1084,18 @@ ${nextLine}`,
 
     document.querySelector<HTMLButtonElement>('#clearButton')?.addEventListener('click', () => {
       this.clearToken().catch(error => this.showMessage('Clear failed', shortError(error)))
+    })
+    window.addEventListener('wheel', event => {
+      if (this.mode !== 'home') return
+      event.preventDefault()
+      this.handleHomeGesture(event.deltaY >= 0 ? 'down' : 'up').catch(console.error)
+    }, { passive: false })
+
+    window.addEventListener('keydown', event => {
+      if (this.mode !== 'home') return
+      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+      event.preventDefault()
+      this.handleHomeGesture(event.key === 'ArrowDown' ? 'down' : 'up').catch(console.error)
     })
   }
 
@@ -927,25 +1127,29 @@ ${nextLine}`,
     }
 
     if (answerInput) {
-      answerInput.disabled = this.mode !== 'reviewQuestion' && this.mode !== 'reviewCorrection'
+      answerInput.disabled = !['reviewQuestion', 'reviewCorrection', 'lessonReviewQuestion'].includes(this.mode)
       answerInput.readOnly = this.mode === 'reviewCorrection'
       answerInput.placeholder = this.mode === 'reviewQuestion'
         ? `Type ${this.reviewPart}${item ? ` for ${displaySubject(item.subject)}` : ''}`
-        : this.mode === 'reviewCorrection'
-          ? 'Press Enter for next review'
-          : 'Start Reviews, then type answer'
+        : this.mode === 'lessonReviewQuestion'
+          ? `Lesson review: type ${this.lessonReviewPart}`
+          : this.mode === 'reviewCorrection'
+            ? 'Press Enter for next review'
+            : 'Start Reviews, then type answer'
     }
 
-    if (answerMode) answerMode.textContent = this.mode === 'reviewQuestion' ? this.reviewPart.toUpperCase() : this.mode === 'reviewCorrection' ? 'WRONG' : 'Idle'
+    if (answerMode) answerMode.textContent = this.mode === 'reviewQuestion' ? this.reviewPart.toUpperCase() : this.mode === 'lessonReviewQuestion' ? `LESSON ${this.lessonReviewPart.toUpperCase()}` : this.mode === 'reviewCorrection' ? 'WRONG' : 'Idle'
     if (answerHelp) answerHelp.textContent = this.mode === 'reviewQuestion'
-      ? 'Type on the phone keyboard; Enter grades it.'
-      : this.mode === 'reviewCorrection'
-        ? 'Wrong answer was submitted. Press Enter or tap the glasses to continue.'
-        : 'Start reviews from the glasses or Refresh/Home, then type here.'
-    if (answerFeedback) answerFeedback.textContent = this.lastAnswerFeedback
+      ? 'Type on the phone keyboard; reading answers convert romaji to kana; Enter grades it.'
+      : this.mode === 'lessonReviewQuestion'
+        ? 'Lesson checkpoint quiz. Reading answers convert romaji to kana; Enter checks it locally.'
+        : this.mode === 'reviewCorrection'
+          ? 'Wrong answer was submitted. Press Enter or tap the glasses to continue.'
+          : 'Start reviews from the glasses or Refresh/Home, then type here.'
+    if (answerFeedback) answerFeedback.textContent = this.mode === 'lessonReviewQuestion' ? this.lessonReviewFeedback : this.lastAnswerFeedback
 
     if (
-      (this.mode === 'reviewQuestion' || this.mode === 'reviewCorrection') &&
+      (this.mode === 'reviewQuestion' || this.mode === 'reviewCorrection' || this.mode === 'lessonReviewQuestion') &&
       answerInput &&
       document.activeElement !== answerInput
     ) {
@@ -953,6 +1157,27 @@ ${nextLine}`,
     }
 
     if (this.mode === 'setup') this.focusTokenInput()
+  }
+
+
+  private shouldKanaInput(): boolean {
+    return (this.mode === 'reviewQuestion' && this.reviewPart === 'reading') ||
+      (this.mode === 'lessonReviewQuestion' && this.lessonReviewPart === 'reading')
+  }
+
+  private scheduleTypingRender(): void {
+    if (this.typingRenderTimer !== null) window.clearTimeout(this.typingRenderTimer)
+    this.typingRenderTimer = window.setTimeout(() => {
+      this.typingRenderTimer = null
+      this.render()
+    }, 80)
+  }
+
+  private updateLiveAnswerMirror(): void {
+    const mirror = document.querySelector<HTMLPreElement>('#mirror')
+    if (!mirror) return
+    const model = this.view()
+    mirror.textContent = `${model.header}\n\n${model.body}\n\n${model.footer}`
   }
 
   private updateTokenInput(): void {
@@ -974,6 +1199,7 @@ ${nextLine}`,
   }
 
   private cleanup(): void {
+    if (this.typingRenderTimer !== null) window.clearTimeout(this.typingRenderTimer)
     if (!this.unsubscribe) return
     this.unsubscribe()
     this.unsubscribe = null
@@ -1074,6 +1300,55 @@ function nextReviewLine(iso: string | null): string {
   const hours = Math.floor(mins / 60)
   const left = mins % 60
   return left ? `${hours}h ${left}m` : `${hours}h`
+}
+
+function mnemonicPages(title: string, text: string): string[] {
+  return paginateText(firstUsefulLine(text, 2000), 330).map((chunk, index, chunks) => {
+    const pageLabel = chunks.length > 1 ? ` (${index + 1}/${chunks.length})` : ''
+    return `${title}${pageLabel}:
+${chunk}`
+  })
+}
+
+function paginateText(text: string, maxChars: number): string[] {
+  const clean = firstUsefulLine(text, 4000)
+  if (!clean) return ['—']
+  const pages: string[] = []
+  let remaining = clean
+  while (remaining.length > maxChars) {
+    let splitAt = remaining.lastIndexOf('\n\n', maxChars)
+    if (splitAt < maxChars * 0.45) splitAt = remaining.lastIndexOf(' ', maxChars)
+    if (splitAt < maxChars * 0.45) splitAt = maxChars
+    pages.push(remaining.slice(0, splitAt).trim())
+    remaining = remaining.slice(splitAt).trim()
+  }
+  if (remaining) pages.push(remaining)
+  return pages
+}
+
+function paginateLines(lines: string[], maxChars: number): string[] {
+  const pages: string[] = []
+  let current = ''
+  for (const line of lines) {
+    const next = current ? `${current}\n${line}` : line
+    if (next.length > maxChars && current) {
+      pages.push(current)
+      current = line
+    } else {
+      current = next
+    }
+  }
+  if (current) pages.push(current)
+  return pages.length ? pages : ['—']
+}
+
+function shuffleArray<T>(items: T[]): T[] {
+  const out = [...items]
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[out[i], out[j]] = [out[j], out[i]]
+  }
+  return out
 }
 
 function firstUsefulLine(text: string, maxChars: number): string {

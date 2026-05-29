@@ -80,6 +80,7 @@ export interface SubjectData {
   meaning_mnemonic?: string
   reading_mnemonic?: string
   parts_of_speech?: string[]
+  component_subject_ids?: number[]
 }
 
 export type SubjectResource = WkResource<SubjectData> & { object: SubjectType }
@@ -130,6 +131,7 @@ export interface StudyItem {
   assignment: AssignmentResource
   subject: SubjectResource
   studyMaterial?: StudyMaterialResource
+  componentSubjects?: SubjectResource[]
 }
 
 export class WaniKaniClient {
@@ -203,6 +205,10 @@ export class WaniKaniClient {
       this.getStudyMaterials(subjectIds).catch(() => ({} as Record<number, StudyMaterialResource>)),
     ])
 
+    const componentIds = Object.values(subjectsById)
+      .flatMap(subject => subject.data.component_subject_ids || [])
+    const componentSubjectsById = componentIds.length ? await this.getSubjects(componentIds) : {}
+
     const items: StudyItem[] = []
     for (const assignment of assignments) {
       const subject = subjectsById[assignment.data.subject_id]
@@ -211,6 +217,10 @@ export class WaniKaniClient {
       const item: StudyItem = { assignment, subject }
       const studyMaterial = studyMaterialsBySubjectId[assignment.data.subject_id]
       if (studyMaterial) item.studyMaterial = studyMaterial
+      const componentSubjects = (subject.data.component_subject_ids || [])
+        .map(id => componentSubjectsById[id])
+        .filter((component): component is SubjectResource => Boolean(component))
+      if (componentSubjects.length) item.componentSubjects = componentSubjects
       items.push(item)
     }
 
