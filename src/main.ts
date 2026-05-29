@@ -15,6 +15,7 @@ import {
   displaySubject,
   hasReadingQuestion,
   meaningMatches,
+  radicalDisplayUnavailable,
   readingMatches,
   shortError,
   stripHtml,
@@ -97,7 +98,7 @@ class G2Display {
             containerID: BODY_ID,
             containerName: 'body',
             content: clip(initial.body, 900),
-            isEventCapture: 1,
+            isEventCapture: 0,
           }),
           new TextContainerProperty({
             xPosition: 0,
@@ -111,7 +112,7 @@ class G2Display {
             containerID: FOOTER_ID,
             containerName: 'footer',
             content: clip(initial.footer, 900),
-            isEventCapture: 0,
+            isEventCapture: 1,
           }),
         ],
       }),
@@ -403,13 +404,20 @@ class WaniPocketApp {
     this.showLoading('Loading reviews', 'Pulling available review assignments and answer data.')
 
     try {
-      this.reviewQueue = await this.wk!.getStudyItems('reviews', 50)
+      const loadedReviews = await this.wk!.getStudyItems('reviews', 50)
+      const skippedRadicals = loadedReviews.filter(item => radicalDisplayUnavailable(item.subject)).length
+      this.reviewQueue = loadedReviews.filter(item => !radicalDisplayUnavailable(item.subject))
       this.reviewIndex = 0
       this.correctionItem = null
-      this.resetReviewAttempt('Type the meaning on your keyboard, then press Enter.')
+      this.resetReviewAttempt(skippedRadicals
+        ? `Skipped ${skippedRadicals} radical${skippedRadicals === 1 ? '' : 's'} this device cannot display. Please review ${skippedRadicals === 1 ? 'it' : 'them'} on WaniKani.`
+        : 'Type the meaning on your keyboard, then press Enter.')
 
       if (this.reviewQueue.length === 0) {
-        this.showMessage('No reviews', nextReviewLine(this.dashboard.nextReviewsAt))
+        const skippedLine = skippedRadicals
+          ? `\n\nSkipped ${skippedRadicals} radical${skippedRadicals === 1 ? '' : 's'} this device cannot display. Please review ${skippedRadicals === 1 ? 'it' : 'them'} on WaniKani.`
+          : ''
+        this.showMessage('No reviews', `${nextReviewLine(this.dashboard.nextReviewsAt)}${skippedLine}`)
         return
       }
 
@@ -960,14 +968,24 @@ class WaniPocketApp {
   private homeView(): ViewModel {
     const user = this.dashboard.user?.data
     const actions = this.homeActions()
+    const pageCount = Math.max(1, Math.ceil(actions.length / HOME_PAGE_SIZE))
+    const menuPage = Math.min(pageCount - 1, Math.floor(this.homeIndex / HOME_PAGE_SIZE))
+    const pageStart = menuPage * HOME_PAGE_SIZE
     const menu = actions
-      .map((action, index) => `${index === this.homeIndex ? '▶' : ' '} ${action.label}`)
+      .slice(pageStart, pageStart + HOME_PAGE_SIZE)
+      .map((action, offset) => {
+        const index = pageStart + offset
+        return `${index === this.homeIndex ? '▶' : ' '} ${action.label}`
+      })
       .join('\n')
+    const stats = menuPage === 0
+      ? `\nNext: ${nextReviewLine(this.dashboard.nextReviewsAt)}`
+      : `\nSynced: ${formatTime(this.dashboard.lastSync)}`
 
     return {
-      header: `WaniPocket${user ? ` · ${user.username} L${user.level}` : ''}`,
-      body: `${menu}\n\nNext review: ${nextReviewLine(this.dashboard.nextReviewsAt)}\nSynced: ${formatTime(this.dashboard.lastSync)}`,
-      footer: 'Swipe: move  ·  Tap: select  ·  Double: exit',
+      header: `WaniPocket${user ? ` · ${user.username} L${user.level}` : ''} · Menu ${menuPage + 1}/${pageCount}`,
+      body: `${menu}${stats}`,
+      footer: 'Ring: move page  ·  Tap: select  ·  Double: exit',
     }
   }
 
@@ -1306,16 +1324,14 @@ Tap to mark the assignment started.`)
       this.clearToken().catch(error => this.showMessage('Clear failed', shortError(error)))
     })
     window.addEventListener('wheel', event => {
-      if (this.mode !== 'home') return
       event.preventDefault()
-      this.handleHomeGesture(event.deltaY >= 0 ? 'down' : 'up').catch(console.error)
+      this.handleGesture(event.deltaY >= 0 ? 'down' : 'up').catch(console.error)
     }, { passive: false })
 
     window.addEventListener('keydown', event => {
-      if (this.mode !== 'home') return
       if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
       event.preventDefault()
-      this.handleHomeGesture(event.key === 'ArrowDown' ? 'down' : 'up').catch(console.error)
+      this.handleGesture(event.key === 'ArrowDown' ? 'down' : 'up').catch(console.error)
     })
   }
 
@@ -1449,10 +1465,11 @@ function injectStyles(): void {
   const style = document.createElement('style')
   style.id = 'wanipocket-styles'
   style.textContent = `
-    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #080b10; color: #eef4ff; }
-    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at top left, rgba(82, 190, 120, .16), transparent 30rem), #080b10; }
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #080b10; color: #eef4ff; overflow: hidden; overscroll-behavior: none; }
+    html, body { height: 100%; overflow: hidden; overscroll-behavior: none; }
+    body { margin: 0; background: radial-gradient(circle at top left, rgba(82, 190, 120, .16), transparent 30rem), #080b10; }
     button, input { font: inherit; }
-    .shell { width: min(980px, calc(100vw - 32px)); margin: 0 auto; padding: 32px 0 56px; }
+    .shell { width: min(980px, calc(100vw - 32px)); height: 100vh; margin: 0 auto; padding: 32px 0 56px; box-sizing: border-box; overflow: hidden; }
     .hero { display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; margin-bottom: 18px; }
     .eyebrow { color: #7ee787; text-transform: uppercase; letter-spacing: .12em; font-size: .78rem; margin: 0 0 8px; }
     h1 { font-size: clamp(2.2rem, 8vw, 5rem); line-height: .9; margin: 0 0 12px; }
@@ -1523,11 +1540,33 @@ function nextReviewLine(iso: string | null): string {
 }
 
 function mnemonicPages(title: string, text: string): string[] {
-  return paginateText(firstUsefulLine(text, 2000), 330).map((chunk, index, chunks) => {
+  return paginateForScreen(firstUsefulLine(text, 2000), BODY_PAGE_CHARS, BODY_PAGE_LINES).map((chunk, index, chunks) => {
     const pageLabel = chunks.length > 1 ? ` (${index + 1}/${chunks.length})` : ''
     return `${title}${pageLabel}:
 ${chunk}`
   })
+}
+
+function paginateForScreen(text: string, maxChars: number, maxLines: number): string[] {
+  const charPages = paginateText(text, maxChars)
+  return charPages.flatMap(page => paginateByLines(page, maxLines))
+}
+
+function paginateByLines(text: string, maxLines: number): string[] {
+  const lines = text.split('\n')
+  const pages: string[] = []
+  let current: string[] = []
+
+  for (const line of lines) {
+    if (current.length >= maxLines) {
+      pages.push(current.join('\n').trim())
+      current = []
+    }
+    current.push(line)
+  }
+
+  if (current.length) pages.push(current.join('\n').trim())
+  return pages.filter(Boolean).length ? pages.filter(Boolean) : ['—']
 }
 
 function paginateText(text: string, maxChars: number): string[] {
