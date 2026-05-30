@@ -7,7 +7,7 @@ import {
   type EvenAppBridge,
   type EvenHubEvent,
 } from '@evenrealities/even_hub_sdk'
-import { PersistStore, STARRED_SUBJECTS_KEY, TOKEN_KEY } from './storage'
+import { PersistStore, OPENAI_API_KEY, STARRED_SUBJECTS_KEY, TOKEN_KEY, TROUBLE_LOG_KEY } from './storage'
 import {
   WaniKaniClient,
   acceptedMeanings,
@@ -26,10 +26,11 @@ import {
   type UserData,
   type WkResource,
 } from './wanikani'
+import { askAiForCoach, askAiToJudgeAnswer, type MnemonicSuggestionInput, type TroubleEntry } from './ai'
 
 type Gesture = 'tap' | 'up' | 'down' | 'double'
 type Mode = 'setup' | 'home' | 'loading' | 'message' | 'help' | 'starred' | 'reviewQuestion' | 'reviewCorrection' | 'lesson' | 'lessonReviewQuestion' | 'lessonCheckpoint'
-type ActionName = 'reviews' | 'lessons' | 'starred' | 'refresh' | 'help'
+type ActionName = 'reviews' | 'lessons' | 'starred' | 'coach' | 'refresh' | 'help'
 type ReviewPart = 'meaning' | 'reading'
 
 interface Dashboard {
@@ -193,6 +194,8 @@ class WaniPocketApp {
   private starredSubjects: SubjectResource[] = []
   private starredIndex = 0
   private starredPage = 0
+  private openAiKey = ''
+  private troubleLog: TroubleEntry[] = []
   private typingRenderTimer: number | null = null
   private unsubscribe: (() => void) | null = null
 
@@ -213,6 +216,9 @@ class WaniPocketApp {
     }
 
     await this.loadStarredSubjects()
+    await this.loadTroubleLog()
+    this.openAiKey = (await this.store.get(OPENAI_API_KEY)).trim()
+    this.updateOpenAiInput()
     this.token = (await this.store.get(TOKEN_KEY)).trim()
     this.updateTokenInput()
 
@@ -295,7 +301,7 @@ class WaniPocketApp {
       case 'reviewCorrection':
         if (gesture === 'double') this.goHome()
         else if (gesture === 'up') await this.toggleCurrentSubjectStar()
-        else if (gesture === 'tap') this.continueAfterCorrection()
+        else if (gesture === 'tap') await this.continueAfterCorrection()
         break
       case 'lesson':
         await this.handleLessonGesture(gesture)
@@ -320,6 +326,7 @@ class WaniPocketApp {
     if (action === 'reviews') await this.startReviews()
     if (action === 'lessons') await this.startLessons()
     if (action === 'starred') await this.startStarred()
+    if (action === 'coach') await this.startAiCoach()
     if (action === 'refresh') await this.refreshDashboard(true)
     if (action === 'help') {
       this.mode = 'help'
@@ -473,7 +480,7 @@ class WaniPocketApp {
     if (this.mode === 'reviewCorrection') {
       this.liveAnswer = ''
       this.setAnswerInput('')
-      this.continueAfterCorrection()
+      await this.continueAfterCorrection()
       return
     }
 
@@ -508,7 +515,7 @@ class WaniPocketApp {
       }
 
       this.reviewMeaningWrong += 1
-      await this.submitWrongReview('meaning', trimmed)
+      await this.showWrongReviewForReport('meaning', trimmed)
       return
     }
 
@@ -520,7 +527,7 @@ class WaniPocketApp {
     }
 
     this.reviewReadingWrong += 1
-    await this.submitWrongReview('reading', trimmed)
+    await this.showWrongReviewForReport('reading', trimmed)
   }
 
   updateLiveAnswer(answer: string): void {
@@ -565,38 +572,53 @@ class WaniPocketApp {
     }
   }
 
-  private async submitWrongReview(part: ReviewPart, given: string): Promise<void> {
+  private async showWrongReviewForReport(part: ReviewPart, given: string): Promise<void> {
     const item = this.currentReview()
-    if (!item || !this.wk) return
+    if (!item) return
 
-    this.showLoading('Marking wrong', `${displaySubject(item.subject)} → WaniKani`)
-    try {
-      await this.wk.createReview({
-        assignmentId: item.assignment.id,
-        incorrectMeaningAnswers: this.reviewMeaningWrong,
-        incorrectReadingAnswers: hasReadingQuestion(item.subject) ? this.reviewReadingWrong : 0,
-      })
-
-      this.correctionItem = item
-      this.correctionPart = part
-      this.correctionGiven = given
-      this.reviewIndex += 1
-      this.dashboard.reviewCount = Math.max(0, this.dashboard.reviewCount - 1)
-      this.liveAnswer = ''
-      this.setAnswerInput('')
-      this.lastAnswerFeedback = `✕ ${part === 'meaning' ? 'Meaning' : 'Reading'} wrong. Correct answer shown. Press Enter or tap the glasses for the next review.`
-      this.mode = 'reviewCorrection'
-      this.render()
-    } catch (error) {
-      this.mode = 'reviewQuestion'
-      this.liveAnswer = ''
-      this.setAnswerInput('')
-      this.lastAnswerFeedback = `Submit failed: ${shortError(error)}`
-      this.render()
-    }
+    this.correctionItem = item
+    this.correctionPart = part
+    this.correctionGiven = given
+    await this.recordTrouble(item, part, given)
+    this.liveAnswer = ''
+    this.setAnswerInput('')
+    this.lastAnswerFeedback = `✕ ${part === 'meaning' ? 'Meaning' : 'Reading'} looks wrong. Use Report on the phone for an AI typo check, or press Enter/tap to submit it wrong.`
+    this.mode = 'reviewCorrection'
+    this.render()
   }
 
-  private continueAfterCorrection(): void {
+  private async submitCorrectionReview(acceptedByAi: boolean): Promise<void> {
+    const item = this.correctionItem
+    if (!item || !this.wk) return
+
+    const meaningWrong = acceptedByAi && this.correctionPart === 'meaning'
+      ? Math.max(0, this.reviewMeaningWrong - 1)
+      : this.reviewMeaningWrong
+    const readingWrong = acceptedByAi && this.correctionPart === 'reading'
+      ? Math.max(0, this.reviewReadingWrong - 1)
+      : this.reviewReadingWrong
+
+    this.showLoading(acceptedByAi ? 'Marking AI-correct' : 'Submitting wrong', `${displaySubject(item.subject)} → WaniKani`)
+    await this.wk.createReview({
+      assignmentId: item.assignment.id,
+      incorrectMeaningAnswers: meaningWrong,
+      incorrectReadingAnswers: hasReadingQuestion(item.subject) ? readingWrong : 0,
+    })
+
+    this.reviewIndex += 1
+    this.dashboard.reviewCount = Math.max(0, this.dashboard.reviewCount - 1)
+  }
+
+  private async continueAfterCorrection(): Promise<void> {
+    try {
+      await this.submitCorrectionReview(false)
+    } catch (error) {
+      this.mode = 'reviewCorrection'
+      this.lastAnswerFeedback = `Submit failed: ${shortError(error)}`
+      this.render()
+      return
+    }
+
     this.correctionItem = null
     this.correctionGiven = ''
 
@@ -739,6 +761,22 @@ class WaniPocketApp {
     await this.refreshDashboard(true)
   }
 
+
+  async saveOpenAiKey(key: string): Promise<void> {
+    this.openAiKey = key.trim()
+    if (this.openAiKey) await this.store.set(OPENAI_API_KEY, this.openAiKey)
+    else await this.store.remove(OPENAI_API_KEY)
+    this.updateOpenAiInput()
+    this.render()
+  }
+
+  async clearOpenAiKey(): Promise<void> {
+    this.openAiKey = ''
+    await this.store.remove(OPENAI_API_KEY)
+    this.updateOpenAiInput()
+    this.render()
+  }
+
   async clearToken(): Promise<void> {
     this.token = ''
     this.wk = null
@@ -771,6 +809,142 @@ class WaniPocketApp {
     if (this.mode === 'lessonReviewQuestion') return this.lessonReviewQueue[this.lessonReviewIndex]?.subject || null
     if (this.mode === 'starred') return this.starredSubjects[this.starredIndex] || null
     return null
+  }
+
+
+  private async loadTroubleLog(): Promise<void> {
+    const raw = await this.store.get(TROUBLE_LOG_KEY)
+    try {
+      const parsed = JSON.parse(raw || '[]') as unknown
+      this.troubleLog = Array.isArray(parsed)
+        ? parsed.filter(isTroubleEntry).slice(-60)
+        : []
+    } catch {
+      this.troubleLog = []
+    }
+  }
+
+  private async saveTroubleLog(): Promise<void> {
+    this.troubleLog = this.troubleLog.slice(-60)
+    await this.store.set(TROUBLE_LOG_KEY, JSON.stringify(this.troubleLog))
+  }
+
+  private async recordTrouble(item: StudyItem, part: ReviewPart, given: string): Promise<void> {
+    const expected = part === 'meaning'
+      ? acceptedMeanings(item.subject, item.studyMaterial)
+      : acceptedReadings(item.subject)
+    this.troubleLog.push({
+      subjectId: item.subject.id,
+      subjectType: item.subject.object,
+      part,
+      given,
+      expected: expected.slice(0, 6),
+      at: new Date().toISOString(),
+    })
+    await this.saveTroubleLog()
+  }
+
+  private async startAiCoach(): Promise<void> {
+    if (!this.requireClient()) return
+    if (!this.openAiKey) {
+      this.showMessage('AI coach needs key', 'Add a ChatGPT API key on the phone first. It is stored locally and used only for AI coach/report requests.')
+      return
+    }
+    if (this.troubleLog.length === 0) {
+      this.showMessage('AI coach', 'No missed answers recorded yet. Do reviews first; misses are saved locally so the coach can find patterns.')
+      return
+    }
+
+    this.showLoading('AI coach', 'Analyzing recent misses and asking ChatGPT for radical-based mnemonics.')
+    try {
+      const suggestions = await this.buildMnemonicSuggestionInputs()
+      const report = await askAiForCoach(this.openAiKey, suggestions)
+      this.showMessage('AI coach', report)
+    } catch (error) {
+      this.showMessage('AI coach failed', shortError(error))
+    }
+  }
+
+  private async buildMnemonicSuggestionInputs(): Promise<MnemonicSuggestionInput[]> {
+    if (!this.wk) return []
+    const grouped = new Map<number, TroubleEntry[]>()
+    for (const entry of this.troubleLog) grouped.set(entry.subjectId, [...(grouped.get(entry.subjectId) || []), entry])
+    const rankedIds = Array.from(grouped.entries())
+      .sort((a, b) => b[1].length - a[1].length || Date.parse(b[1][b[1].length - 1]?.at || '') - Date.parse(a[1][a[1].length - 1]?.at || ''))
+      .slice(0, 6)
+      .map(([id]) => id)
+    const subjectsById = await this.wk.getSubjects(rankedIds)
+    const componentSubjectsBySubjectId = await this.loadComponentSubjects(Object.values(subjectsById))
+
+    return rankedIds
+      .map(id => subjectsById[id]
+        ? { subject: subjectsById[id], misses: grouped.get(id) || [], componentSubjects: componentSubjectsBySubjectId[id] || [] }
+        : null)
+      .filter((item): item is MnemonicSuggestionInput => Boolean(item))
+  }
+
+  private async loadComponentSubjects(subjects: SubjectResource[]): Promise<Record<number, SubjectResource[]>> {
+    if (!this.wk) return {}
+    const directIds = Array.from(new Set(subjects.flatMap(subject => subject.data.component_subject_ids || [])))
+    const directById = directIds.length ? await this.wk.getSubjects(directIds) : {}
+    const nestedRadicalIds = Object.values(directById)
+      .filter(subject => subject.object === 'kanji')
+      .flatMap(subject => subject.data.component_subject_ids || [])
+    const radicalById = nestedRadicalIds.length ? await this.wk.getSubjects(nestedRadicalIds) : {}
+    const allById = { ...directById, ...radicalById }
+
+    const out: Record<number, SubjectResource[]> = {}
+    for (const subject of subjects) {
+      const components = (subject.data.component_subject_ids || [])
+        .flatMap(id => {
+          const component = directById[id]
+          if (!component) return []
+          if (component.object !== 'kanji') return [component]
+          const radicals = (component.data.component_subject_ids || [])
+            .map(radicalId => radicalById[radicalId])
+            .filter((radical): radical is SubjectResource => Boolean(radical))
+          return [component, ...radicals]
+        })
+      out[subject.id] = uniqueSubjects(components.length ? components : Object.values(allById))
+    }
+    return out
+  }
+
+  async reportCorrectionToAi(): Promise<void> {
+    const item = this.correctionItem
+    if (!item) return
+    if (!this.openAiKey) {
+      this.lastAnswerFeedback = 'Add a ChatGPT API key on the phone before reporting answers.'
+      this.render()
+      return
+    }
+
+    this.showLoading('AI answer report', 'Asking ChatGPT whether your answer should count as correct before submitting to WaniKani.')
+    try {
+      const result = await askAiToJudgeAnswer(this.openAiKey, item, this.correctionPart, this.correctionGiven)
+      if (result.accepted && result.confidence !== 'low') {
+        await this.submitCorrectionReview(true)
+        const reason = result.reason
+        this.correctionItem = null
+        this.correctionGiven = ''
+        if (this.reviewIndex >= this.reviewQueue.length) {
+          this.showMessage('AI accepted', `Marked correct on WaniKani. Reason: ${reason}`)
+          return
+        }
+        this.resetReviewAttempt(`AI accepted your answer and WaniKani was marked correct. ${reason}`)
+        this.mode = 'reviewQuestion'
+        this.render()
+        return
+      }
+
+      this.mode = 'reviewCorrection'
+      this.lastAnswerFeedback = `AI kept it wrong (${result.confidence}): ${result.reason}`
+      this.render()
+    } catch (error) {
+      this.mode = 'reviewCorrection'
+      this.lastAnswerFeedback = `AI report failed: ${shortError(error)}`
+      this.render()
+    }
   }
 
   private async loadStarredSubjects(): Promise<void> {
@@ -1018,7 +1192,7 @@ class WaniPocketApp {
   private helpView(): ViewModel {
     return {
       header: 'Controls',
-      body: 'Home:\nRing = move/menu pages\nTap = select\nDouble = exit\n\nReviews with keyboard:\nType answer on phone\nEnter = grade\nWrong answer = submitted wrong + shows correct answer\nEnter/tap again = next review\nDouble = home\n\nPaging:\nRing scroll = page text\nNo body scrolling\n\nStars:\nRing up on first item page = star/unstar\nHome > Starred = revisit saved items\n\nLessons:\nTap = next / start\nRing down = next page\nRing up = previous page/star on first\nDouble = home',
+      body: 'Home:\nRing = move/menu pages\nTap = select\nDouble = exit\n\nReviews with keyboard:\nType answer on phone\nEnter = grade\nWrong answer = pause + report option\nEnter/tap again = submit wrong + next review\nPhone Report = ask AI to accept typo/equivalent\nDouble = home\n\nPaging:\nRing scroll = page text\nNo body scrolling\n\nStars:\nRing up on first item page = star/unstar\nHome > Starred = revisit saved items\n\nLessons:\nTap = next / start\nRing down = next page\nRing up = previous page/star on first\nDouble = home',
       footer: 'Tap/Double: home',
     }
   }
@@ -1058,7 +1232,7 @@ ${clip(readings, 220)}
 ${answeredPart} mnemonic:
 ${firstUsefulLine(mnemonic, 4000)}
 ` : ''
-    const nextLine = this.reviewIndex >= this.reviewQueue.length ? 'Press Enter/tap to finish.' : `Press Enter/tap for review ${this.reviewIndex + 1}/${this.reviewQueue.length}.`
+    const nextLine = this.reviewIndex >= this.reviewQueue.length ? 'Report on phone or Enter/tap to submit wrong and finish.' : `Report on phone or Enter/tap to submit wrong and continue.`
 
     return {
       header: `Marked wrong · ${answeredPart}`,
@@ -1072,7 +1246,7 @@ Correct meaning:
 ${clip(meanings, 220)}
 ${readingLine}${mnemonicLine}
 ${nextLine}`,
-      footer: 'Enter/tap: next  ·  Double: home',
+      footer: 'Phone Report: AI  ·  Enter/tap: submit wrong  ·  Double: home',
     }
   }
 
@@ -1092,6 +1266,7 @@ ${nextLine}`,
       { name: 'reviews', label: `Reviews (${this.dashboard.reviewCount})` },
       { name: 'lessons', label: `Lessons (${this.dashboard.lessonCount})` },
       { name: 'starred', label: `Starred (${this.starredIds.size})` },
+      { name: 'coach', label: `AI coach (${this.troubleLog.length})` },
       { name: 'refresh', label: 'Refresh now' },
       { name: 'help', label: 'Controls' },
     ]
@@ -1227,7 +1402,7 @@ Tap to mark the assignment started.`)
           <div>
             <p class="eyebrow">Even G2 · WaniKani</p>
             <h1>WaniPocket</h1>
-            <p class="muted">Use a Bluetooth keyboard connected to your phone for WaniKani reviews. Wrong answers are submitted as wrong, then the correct answer appears before you continue.</p>
+            <p class="muted">Use a Bluetooth keyboard connected to your phone for WaniKani reviews. Wrong answers can be reported to AI before they are submitted, then the correct answer appears before you continue.</p>
           </div>
           <div class="status-pill" id="bridgeStatus">${this.bridge ? 'G2 bridge ready' : 'Browser mode'}</div>
         </section>
@@ -1245,6 +1420,19 @@ Tap to mark the assignment started.`)
             <button type="submit">Enter</button>
           </form>
           <p class="feedback" id="answerFeedback"></p>
+          <button id="reportAnswerButton" type="button" class="secondary full" disabled>Report wrong answer to AI</button>
+        </section>
+
+        <section class="card">
+          <h2>ChatGPT API key</h2>
+          <p class="muted small">Optional. Used for AI Coach and answer reports. Stored locally and sent only to OpenAI for those requests.</p>
+          <form id="openAiForm" class="token-row">
+            <input id="openAiInput" type="password" autocomplete="off" spellcheck="false" placeholder="Paste OpenAI / ChatGPT API key" />
+            <button type="submit">Save</button>
+          </form>
+          <div class="button-row">
+            <button id="clearOpenAiButton" type="button" class="secondary">Clear ChatGPT key</button>
+          </div>
         </section>
 
         <section class="card">
@@ -1320,6 +1508,20 @@ Tap to mark the assignment started.`)
       }
     })
 
+    document.querySelector<HTMLButtonElement>('#reportAnswerButton')?.addEventListener('click', () => {
+      this.reportCorrectionToAi().catch(error => this.showMessage('AI report failed', shortError(error)))
+    })
+
+    document.querySelector<HTMLFormElement>('#openAiForm')?.addEventListener('submit', event => {
+      event.preventDefault()
+      const value = document.querySelector<HTMLInputElement>('#openAiInput')?.value || ''
+      this.saveOpenAiKey(value).catch(error => this.showMessage('Save failed', shortError(error)))
+    })
+
+    document.querySelector<HTMLButtonElement>('#clearOpenAiButton')?.addEventListener('click', () => {
+      this.clearOpenAiKey().catch(error => this.showMessage('Clear failed', shortError(error)))
+    })
+
     document.querySelector<HTMLFormElement>('#tokenForm')?.addEventListener('submit', event => {
       event.preventDefault()
       const value = document.querySelector<HTMLInputElement>('#tokenInput')?.value || ''
@@ -1362,6 +1564,7 @@ Tap to mark the assignment started.`)
     const answerMode = document.querySelector<HTMLElement>('#answerMode')
     const answerHelp = document.querySelector<HTMLElement>('#answerHelp')
     const answerFeedback = document.querySelector<HTMLElement>('#answerFeedback')
+    const reportAnswerButton = document.querySelector<HTMLButtonElement>('#reportAnswerButton')
     const item = this.currentReview()
 
     if (!this.isComposingAnswer) {
@@ -1390,9 +1593,13 @@ Tap to mark the assignment started.`)
       : this.mode === 'lessonReviewQuestion'
         ? 'Lesson checkpoint quiz. Reading answers convert romaji to kana; Enter checks it locally.'
         : this.mode === 'reviewCorrection'
-          ? 'Wrong answer was submitted. Press Enter or tap the glasses to continue.'
+          ? 'Wrong answer is paused. Report it to AI or press Enter/tap to submit wrong.'
           : 'Start reviews from the glasses or Refresh/Home, then type here.'
     if (answerFeedback) answerFeedback.textContent = this.mode === 'lessonReviewQuestion' ? this.lessonReviewFeedback : this.lastAnswerFeedback
+    if (reportAnswerButton) {
+      reportAnswerButton.disabled = this.mode !== 'reviewCorrection' || !this.correctionItem || !this.openAiKey
+      reportAnswerButton.textContent = this.openAiKey ? 'Report wrong answer to AI' : 'Add ChatGPT key to report'
+    }
 
     if (
       (this.mode === 'reviewQuestion' || this.mode === 'reviewCorrection' || this.mode === 'lessonReviewQuestion') &&
@@ -1424,6 +1631,11 @@ Tap to mark the assignment started.`)
     if (!mirror) return
     const model = this.currentPagedView()
     mirror.textContent = `${model.header}\n\n${model.body}\n\n${model.footer}`
+  }
+
+  private updateOpenAiInput(): void {
+    const input = document.querySelector<HTMLInputElement>('#openAiInput')
+    if (input) input.value = this.openAiKey
   }
 
   private updateTokenInput(): void {
@@ -1498,6 +1710,8 @@ function injectStyles(): void {
     #answerInput { font-size: 1.2rem; min-height: 54px; }
     button { border: 0; border-radius: 14px; padding: 13px 18px; background: #7ee787; color: #07100a; font-weight: 750; cursor: pointer; }
     button.secondary { background: rgba(255,255,255,.09); color: #eef4ff; border: 1px solid rgba(255,255,255,.12); }
+    button.full { width: 100%; margin-top: 10px; }
+    button:disabled { opacity: .48; cursor: not-allowed; }
     .button-row { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
     .feedback { min-height: 1.3em; margin: 12px 0 0; color: #dce8f8; }
     .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
@@ -1616,6 +1830,28 @@ function shuffleArray<T>(items: T[]): T[] {
   for (let i = out.length - 1; i > 0; i -= 1) {
     const j = Math.floor(Math.random() * (i + 1))
     ;[out[i], out[j]] = [out[j], out[i]]
+  }
+  return out
+}
+
+
+function isTroubleEntry(value: unknown): value is TroubleEntry {
+  if (!value || typeof value !== 'object') return false
+  const record = value as Record<string, unknown>
+  return typeof record.subjectId === 'number' &&
+    (record.part === 'meaning' || record.part === 'reading') &&
+    typeof record.given === 'string' &&
+    Array.isArray(record.expected) &&
+    typeof record.at === 'string'
+}
+
+function uniqueSubjects(subjects: SubjectResource[]): SubjectResource[] {
+  const seen = new Set<number>()
+  const out: SubjectResource[] = []
+  for (const subject of subjects) {
+    if (seen.has(subject.id)) continue
+    seen.add(subject.id)
+    out.push(subject)
   }
   return out
 }
